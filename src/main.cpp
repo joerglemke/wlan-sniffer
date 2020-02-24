@@ -29,6 +29,7 @@ int capturePacketSize = 256;
 int captureMgmtPacketSize = 1024;
 int captureLargeDataLimit = 256;
 int captureLargeDataPacketSize = 128;
+int apChannel = 0;
 int currentChannel = AP_CHANNEL;
 bool channelHopping = false;
 bool fullData = false;
@@ -41,7 +42,7 @@ byte filterMac[6];
 bool sniffing = false;
 bool active = false;
 
-Button2 controlButton(0);
+// Button2 controlButton(0);
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -132,20 +133,63 @@ void showOperatingMode() {
   }
 }
 
+#define XMIT_BUFFER_SIZE 80000 
+uint8_t xmitBuffer[XMIT_BUFFER_SIZE];
+int xmitWrite = 0;
+int xmitRead = 0;
+
+int xmitAvail() {
+  int avail = xmitRead - xmitWrite;
+  if (avail <= 0) {
+    avail += XMIT_BUFFER_SIZE;
+  }
+  return avail-1;
+}
+
+void xmitQueueAll(uint8_t* data, int len) {
+  int avail = xmitAvail();
+  if (avail < len) return;
+  avail = XMIT_BUFFER_SIZE - xmitWrite;
+  if (len <= avail) {
+    memcpy(xmitBuffer+xmitWrite, data, len);
+    xmitWrite += len;
+  } else {
+    memcpy(xmitBuffer+xmitWrite, data, avail);
+    len -= avail;
+    memcpy(xmitBuffer, data+avail, len);
+    xmitWrite = len;
+  }
+}
+
+void xmitSendAll() {
+  int avail = xmitWrite - xmitRead;
+  if (avail == 0) return;
+  if (avail < 0) {
+    int len = XMIT_BUFFER_SIZE-xmitRead;
+    Serial.write(xmitBuffer+xmitRead, len);
+    avail = avail + XMIT_BUFFER_SIZE - len;
+    Serial.write(xmitBuffer, avail);
+    xmitRead = avail;
+  } else {
+    Serial.write(xmitBuffer+xmitRead, avail);
+    xmitRead += avail;
+  }
+}
+
 void pcap32(uint32_t n){
   uint8_t buf[4];
   buf[0] = n;
   buf[1] = n >> 8;
   buf[2] = n >> 16;
   buf[3] = n >> 24;
-  Serial.write(buf, 4);
+  xmitQueueAll(buf, 4);
 }
 
 void pcap16(uint16_t n){
   uint8_t buf[2];
   buf[0] = n;
   buf[1] = n >> 8;
-  Serial.write(buf, 2);
+  xmitQueueAll(buf, 2);
 }
 
 void pcapHeader(){
@@ -165,18 +209,19 @@ void pcapPacket(int64_t ts, uint32_t len, uint8_t* buf, uint32_t snaplen) {
   if (snaplen > len) {
     snaplen = len;
   }
-  pcap32((uint32_t)(ts / 1000000) + timeOffset);
-  pcap32((uint32_t)(ts % 1000000));
-  pcap32(snaplen);
-  pcap32(len);
-  Serial.write(buf, snaplen);
+  int avail = xmitAvail();
+  if (avail >= snaplen + 16) {
+    pcap32((uint32_t)(ts / 1000000) + timeOffset);
+    pcap32((uint32_t)(ts % 1000000));
+    pcap32(snaplen);
+    pcap32(len);
+    xmitQueueAll(buf, snaplen);
+  }
 }
 
-/* will be executed on every packet the ESP32 gets while beeing in promiscuous mode */
-void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
+IRAM_ATTR void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (!sniffing) {
     if (active) {
-      Serial.flush();
       setOperatingMode(OPM_STOPPED);
       active = false;
     }
@@ -185,6 +230,7 @@ void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
 
   if (!active) {
     Serial.print("SNIFFMODE=running\r\n");
+    Serial.flush();
     setOperatingMode(OPM_RUNNING);
     active = true;
     pcapHeader();
@@ -236,19 +282,30 @@ esp_err_t event_handler(void *ctx, system_event_t *event) {
   return ESP_OK;
 }
 
-void initWiFi(int ap_channel) {
+void initWiFi() {
   tcpip_adapter_init();
   ESP_ERROR_CHECK( esp_event_loop_init(event_handler, NULL) );
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK( esp_wifi_init(&cfg) );
   ESP_ERROR_CHECK( esp_wifi_set_storage(WIFI_STORAGE_RAM) );
-  ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_NULL) );  
-  // ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_AP) );  
-  // wifi_config_t ap_config;
-  // ap_config.ap.channel = ap_channel;
-  // // ap_config.ap.beacon_interval = 500;
-  // ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_AP, &ap_config) );
-  // ESP_ERROR_CHECK( esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20) );
+  if (apChannel == 0) {
+    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_NULL) );  
+  } else {
+    ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_AP) );
+    wifi_bandwidth_t bandwidth = WIFI_BW_HT20;
+    if (apChannel < 0) {
+      bandwidth = WIFI_BW_HT40;
+      apChannel = -apChannel;
+    }
+    delay(3000);
+    wifi_config_t wifi_config;
+    memset(&wifi_config, 0, sizeof(wifi_config));
+    memcpy(wifi_config.ap.ssid, "xx", 2);
+    wifi_config.ap.ssid_len = 2;
+    wifi_config.ap.channel = apChannel;
+    ESP_ERROR_CHECK( esp_wifi_set_config(WIFI_IF_AP, &wifi_config) );
+    ESP_ERROR_CHECK( esp_wifi_set_bandwidth(WIFI_IF_AP, bandwidth) );
+  }
   ESP_ERROR_CHECK( esp_wifi_start() );
 }
 
@@ -262,17 +319,23 @@ void startSniffing() {
 
   sniffing = true;
 
-  initWiFi(AP_CHANNEL);
+  initWiFi();
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  wifi_promiscuous_filter_t filter;
+  memset(&filter, 0, sizeof(filter));
+  filter.filter_mask = WIFI_PROMIS_FILTER_MASK_ALL;
+  esp_wifi_set_promiscuous_filter(&filter);
   esp_wifi_set_promiscuous_rx_cb(sniffer);
 
   setOperatingMode(OPM_STARTED);
 }
 
 void stopSniffing() {
-  sniffing = false;
-  setOperatingMode(OPM_STOPPING);
+  if (sniffing) {
+    sniffing = false;
+    setOperatingMode(OPM_STOPPING);
+  }
   // esp_wifi_set_promiscuous(false);
   // esp_wifi_set_promiscuous_rx_cb(NULL);
   // esp_wifi_stop();
@@ -316,6 +379,8 @@ void processSerial(int ch) {
     filterMac[5] = mac6;
   } else if (!strcmp(cmdBuffer, "channel")) {
     sscanf(args, "%d", &currentChannel);
+  } else if (!strcmp(cmdBuffer, "ap")) {
+    sscanf(args, "%d", &apChannel);
   } else if (!strcmp(cmdBuffer, "sizes")) {
     sscanf(args, "%d,%d,%d,%d", &capturePacketSize, &captureMgmtPacketSize, &captureLargeDataLimit, &captureLargeDataPacketSize);
   } else if (!strcmp(cmdBuffer, "scan")) {
@@ -336,6 +401,7 @@ void processSerial(int ch) {
 }
 
 void setup() {
+  pinMode(0, INPUT);
   pinMode(LED_BLUE, OUTPUT);
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
@@ -346,13 +412,18 @@ void setup() {
   Serial.println();
   Serial.printf("ESP32PCAP baudrate=%d\r\n", SERIAL_MAX_BAUDRATE);
 
-  controlButton.setPressedHandler([](Button2 & b) {
-    stopSniffing();
-  });
+  // controlButton.setPressedHandler([](Button2 & b) {
+  //   stopSniffing();
+  // });
 }
 
 void loop() {
-  controlButton.loop();
+  xmitSendAll();
+
+  // controlButton.loop();
+  if (digitalRead(0) == LOW) {
+    stopSniffing();
+  }
   showOperatingMode();
 
   if (Serial.available() > 0) {
